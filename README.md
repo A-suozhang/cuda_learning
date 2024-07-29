@@ -539,7 +539,90 @@ for (int s = 1; s < bdim; s *= 2)
     - blockDim, GridDim所定义
 - Textures: 是一个ReadOnly的，物理上的Cache结构
 
-# [Application] 将CUDA Code打包为Python Extension的形式
+---
+
+# [Profiling]
+
+## [Application] 如何更准确的Profile CUDA Kernel Latency
+
+> 参考了教程：[How to Accurately Time CUDA Kernels in Pytorch | Speechmatics](https://blog.speechmatics.com/cuda-timings)
+> 
+1. 使用Host-Device Synchronization:
+    - 由于CPU和GPU执行是异步的，所以当CUDA kernel开始跑的时候，可能CPU会继续launch后面的kernel，导致kenrel排队以产生overhead。
+    - **解决方案：**在time stop的code之前，调用Synchronize
+    
+    ```jsx
+    run_kernel()
+    torch.cuda.synchronize()
+    ```
+    
+    ![Untitled](%5BCUDA%20Learning%5D%20fe71681b7adc4709871b2af69c765163/Untitled%2020.png)
+    
+2. 使用CUDA Event记录：synchronization会拖慢整个进程（因为等待同步），所以可以使用CUDA Event来记录kernel时间。
+    - **关键作用：**可以把Kernel Launch的额外延迟去掉
+    
+    ![Untitled](%5BCUDA%20Learning%5D%20fe71681b7adc4709871b2af69c765163/Untitled%2021.png)
+    
+
+```jsx
+steps = 10
+start_events = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
+end_events = [torch.cuda.Event(enable_timing=True) for _ in range(steps)]
+
+for i in range(steps):
+    start_events[i].record()
+    run_kernel()
+    end_events[i].record()
+
+torch.cuda.synchronize()
+times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+```
+
+1. Warmup Steps：先进行几个iter的timestep，避免额外的overhead，可能出现的：
+    - PyTorch JIT的JIT fuse（在第一次遇到该tensor的时候）
+    - `torch.cudnn.benchmark` on-the-fly 的Microbenchmarking，确定最优的convolution kernel（依据输入数据）
+    - CUDA kernel的Lazy loading into CUDA context（CUDA 11.7之后的特性）
+    - `cudaMalloc`本身的overhead
+2. Fix GPU clock: 校准GPU时钟，可能随着温度等因素变化（感觉有点边缘了）
+3. Cache Flush: 为了保证GPU memory cache在每次call的时候被清空，避免因为反复执行同样的kernel with cached, 造成高cache hit rate，从而把kernel测快了（低估了延迟）
+    - **解决方案（简单）**：对不同run用不同数据，但是weight等static的东西，还是存在cache里面的
+    - **解决方案（完善）**：显示的在不同pass之间clear cache。
+4. Sleep/ CUDA Graph:
+    - 之前的CUDA Event方式并不是silver bullet，它**假设**了下一个kernel立刻在前一个kernel完成执行（时候的CUDA Event）执行（在profile很小的kenel的时候，这个假设并不存在）
+    - （在profile很小的kenel的时候，这个假设并不存在）
+        - Kernel execution 可能比Kenrel launch还要快，GPU outrun了CPU
+        - 此时CUDA Event可能会将launch的overhead也记录到CUDA Kernel的运行时间里
+    - **解决方案1 (Saturate the command queue)：**
+        - 用一个足够intensive的kernel，把GPU占满（保证我们在乎的kernel的执行，是在它的cuda launch后的cuda event的结束之后才开始）
+        - 或者干脆显示让GPU等待
+        
+        ```jsx
+        CUDA's __nanosleep 
+        torch.cuda._sleep()
+        ```
+        
+    
+    ![Untitled](%5BCUDA%20Learning%5D%20fe71681b7adc4709871b2af69c765163/Untitled%2022.png)
+    
+    - **解决方案2（MInimize the CUDA launch overhead）：**采用CUDA Graph，把一系列kenrel launch合并成launch一个很大的single kernel；
+
+## [Application] 理解Nsys Log中的各层面Overhead
+
+> 笔记 of [Understanding the Visualization of Overhead and Latency in NVIDIA Nsight Systems | NVIDIA Technical Blog](https://developer.nvidia.com/blog/understanding-the-visualization-of-overhead-and-latency-in-nsight-systems/)
+> 
+- 几个简单的定义：
+    - **Latency：**包含两种（Launch & Task）
+        - **Launch Latency:** the time range from the beginning of the launch API call to the beginning of the kernel execution
+        - **Task latency, or total time:**  is the time between adding a task to the queue and the task finishing
+    - **Overhead:** We define overhead as the time it takes to perform some operation that “you’d ideally want to take zero time”
+        - **CPU Wrapper Overhead:** the wrappers around a CUDA kernel on the host CPU side （nsys中CUDA API的蓝色部分）
+        - **Memory Overhead:** moving data back and forth from the CPU to the GPU
+            - The memory overhead can be hidden with kernel launches, GPU可以边继续写上一个kernel的数据，同时计算新的kernel
+        - **GPU Launch Overhead:** GPU to retrieve the command and begin executing it
+            - 比如GPU被一个很大的workload给block住了
+            - 有一些memcpy(比如读取同一位置的数据)，会需要wait前面的thread完成
+
+# **[Application] 将CUDA Code打包为Pyth**on Extension的形式
 
 > 主要参考了PyTorch官方的Tutorial：https://pytorch.org/tutorials/advanced/cpp_extension.html
 > 
@@ -562,7 +645,6 @@ for (int s = 1; s < bdim; s *= 2)
         - 最后pack成一个`CUDAExtention`类(`torch.utils.cpp_extension`) 中包含的文件输入给setup函数
     - 完成安装后会出现一个 `${package_name}.egg-info` 是python package安装所产生的，里面包含了一些记录dependency等metadata的文本文件
     - `setup()` 为main函数，其描述的过程：[Learn about Building a Python Package — Python Packaging Guide (pyopensci.org)](https://www.pyopensci.org/python-package-guide/package-structure-code/python-package-distribution-files-sdist-wheel.html)
-        - 
     - 编译完成的文件在 ./build/ 中（若干MB）
         - `temp.linux-x86_64-cpython-38` 中包含了各种.o的输出文件
             - 以及Ninja的一些build_log
@@ -621,7 +703,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 ```
 
-- (?) 有一个section是**using accessor**，似乎是一个更高维度的类Tensor封装，而不是直接
+- **Using “Accessor”**
+    - ATen所提供的一种对高维数据的寻址方式，可以不控制单个pointer
+        - **`gates.data<scalar_t>()[n***3***state_size** **+** **row*state_size** **+** **column]`  → `auto** **foo_a** **=** **foo.accessor<float,**2**>();  trace** **+=** **foo_a[i][i];**`
+        - 对cuda的equivalent是 `packed_accessor64` 和 `packed_accessor_32`
 
 ### mixdq_extension代码
 
@@ -643,17 +728,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         - `forward_callback()` 仍然用F.conv2d
     - `quantizer_dequantizer.py`  （？是否有被用到）
 - csrc：
-    - 
+    - `main.cpp` 总文件，包含了pybind的描述
+        - `initQuantizedLinearBindings`  在 `qlinear.h` 中声明为空，在`qlinear.cc` 中定义
+            - `m.def(”function_name”, input_args…)`
+    
+    ```jsx
+    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+        mixdq::initQuantizedLinearBindings(m);
+        mixdq::initQuantizedConv2dBindings(m);
+        mixdq::initQuantizationBindings(m);
+    }   
+    ```
+    
+    - `qlinear/qconv` 文件夹，中主要包括了`qlinear.h` 与 `qlinear.cc`
+    - 有一个common文件夹中，包括了一个 `default_epilogue_tensor_op.h` 似乎是CUTLASS中copy出来的
 
 ### 外围Python Code
+
+- `./scripts/run_quantize_output_picture.sh`  调用了 `quantize_sdxl.py`   (未指定profile)
 
 ### Qs
 
 - [ ]  开发过程中，大概不会用python调用来对比reference的吗？
     - ops里面的code是调用的`mixdq_extension._C.qconv2d_w8_a8_ohalf` 来操作，如果这样的话每次修改code都需要跑一个完整的编译过程（是不是有点费劲了）
     - debug的时候直接写个main函数nvcc单个文件的吗
-- [ ]  profiling工具？
+- [x]  profiling工具？
 - [x]  conv2d_on_quantized_data 是在哪里被用到？还是只是test用？
+- [x]  为什么要先import torch, 才有mixdq_extension._C
+- [[SOLVED] Finding the maximum values with CUDA - CUDA / CUDA Programming and Performance - NVIDIA Developer Forums](https://forums.developer.nvidia.com/t/solved-finding-the-maximum-values-with-cuda/53588)
 
 # References:
 
@@ -673,3 +775,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 - Nvidia Developer Blogs的对应Code：[code-samples/posts at master · NVIDIA-developer-blog/code-samples (github.com)](https://github.com/NVIDIA-developer-blog/code-samples/tree/master/posts)
     - 一些新Feature的介绍：[Programming Tensor Cores in CUDA 9 | NVIDIA Technical Blog](https://developer.nvidia.com/blog/programming-tensor-cores-cuda-9/)
 - 一系列库的简介：[cuBLAS - 上海交大超算平台用户手册 Documentation (sjtu.edu.cn)](https://docs.hpc.sjtu.edu.cn/app/compilers_and_languages/cublas.html)
+- Kernel实际撰写案例：[How to write a fast Softmax CUDA kernel? · facebookincubator/AITemplate Wiki (github.com)](https://github.com/facebookincubator/AITemplate/wiki/How-to-write-a-fast-Softmax-CUDA-kernel%3F)
+- 如何准确的Profile Kernel的执行时间：[How to Accurately Time CUDA Kernels in Pytorch | Speechmatics](https://blog.speechmatics.com/cuda-timings)
+- 一个腾讯云的工程师写的CUDA入门指南： https://github.com/Tony-Tan/CUDA_Freshman
+    - [谭升的博客 (face2ai.com)](https://face2ai.com/)
+- [Fast and Accurate GPU Quantization for Transformers | Speechmatics](https://blog.speechmatics.com/gpu-quantisation)
+
+# Triton (Resources)
+
+- [Introducing Triton: Open-source GPU programming for neural networks | OpenAI](https://openai.com/index/triton/) 官方对Triton的介绍：
+    - **目的**：developers can better focus on the high-level logic，只需要调整一些关键的算法处理（tiling, inter-SM的逻辑）
+    - 将CUDA programming logic划分为3层结构：描述了DRAM，SRAM，ALU(SM)之间的关系
+        - Memory Transfer to DRAM**需要被集中（Coscaled）来利用大带宽**
+        - 数据必须被stashed into SRAM (Shared Memory) before被复用，以及需要被properly managed来**减少memory bank conflict**。
+        - 计算需要被合理安排（partitioned and scheduled），以提升**instruction/thread-level的并行度**。
+    
+    ![Untitled](%5BCUDA%20Learning%5D%20fe71681b7adc4709871b2af69c765163/Untitled%2023.png)
+    
+    - 与Numba相对**最为相似**：
+        - kernels are defined as decorated Python functions
+        - launched concurrently with different `program_id`’s on a grid of so-called *instances*
+        - **区别**：triton定义grid（instance）内部的parallel的方式：通过对block（arrays of 2的幂次size）的操作（反映SIMT的特性）
+        - **关键**：Triton effectively abstracts away all the issues related to concurrency *within* CUDA thread blocks
+            - (e.g., memory coalescing, shared memory synchronization/conflicts, tensor core scheduling)
+            - 例子：fused softmax，因为多个thred同时对某个row做reduce，需要显示撰写threads synchronization.
+    - System Arhitecture:
+        - python code —(AST Visitor)—> Triton IR —(LLVM-IR)—> LLVM-IR —(libLLVM)→ PTX
+            - **Triton JIT decorator:** walking the Abstract Syntax Tree (AST) of the provided Python function so as to generate Triton-IR on-the-fly
+            - The resulting IR code is then simplified, optimized and automatically parallelized by compiler backend
+            - converted into high-quality LLVM-IR—and eventually PTX—for execution on recent NVIDIA GPUs
+- [Accelerating Triton Dequantization Kernels for GPTQ | PyTorch](https://pytorch.org/blog/accelerating-triton/) 怎么用triton进一步调优
+- [Understanding the Triton Tutorials Part 1 | by Isamu Isozaki | Medium](https://isamu-website.medium.com/understanding-the-triton-tutorials-part-1-6191b59ba4c)  一系列Triton tutorial
+    - [Understanding Triton Tutorials Part 2 | by Isamu Isozaki | Jun, 2024 | Medium](https://isamu-website.medium.com/understanding-triton-tutorials-part-2-f6839ce50ae7)
+- [Using User-Defined Triton Kernels with torch.compile — PyTorch Tutorials 2.3.0+cu121 documentation](https://pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html)   使用torch.compile更高效的优化kernel
